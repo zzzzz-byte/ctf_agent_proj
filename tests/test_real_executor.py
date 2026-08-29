@@ -375,6 +375,77 @@ async def test_target_none_without_container_no_target():
     assert "# 目标地址(靶机)" not in prompt
 
 
+class _SslTargetAdapter:
+    """start_target 返回带 nc_ssl/access_type 的完整访问信息。"""
+
+    def __init__(self, host="tcp.example.com", port=9999, nc_ssl=True, access_type="tcp"):
+        self.starts = []
+        self._host, self._port, self._nc_ssl, self._access_type = host, port, nc_ssl, access_type
+
+    def start_target(self, challenge_id):
+        self.starts.append(challenge_id)
+        return {"host": self._host, "port": self._port,
+                "access_url": f"{self._host}:{self._port}",
+                "access_type": self._access_type, "nc_ssl": self._nc_ssl,
+                "status": "running", "environment_id": "env-1",
+                "expires_at": "2030-01-01T00:00:00"}
+
+
+async def test_target_lazy_start_target_info_captures_nc_ssl():
+    """兜底 start_target 后 target_info 带上 nc_ssl,提示词渲染 TLS 注意,且不含生命周期噪音。"""
+    adapter = _SslTargetAdapter()
+    prompt = await _capture_prompt(
+        task={"challenge_id": "c-9", "has_container": 1}, adapter=adapter)
+    assert "tcp.example.com:9999" in prompt
+    assert "TLS" in prompt
+    assert "nc_ssl" in prompt
+    assert "environment_id" not in prompt
+    assert "expires_at" not in prompt
+
+
+async def test_target_lazy_start_target_info_http_hint():
+    """access_type=http → 提示用 curl 而非 nc 裸连接。"""
+    adapter = _SslTargetAdapter(access_type="http", nc_ssl=False)
+    prompt = await _capture_prompt(
+        task={"challenge_id": "c-10", "has_container": 1}, adapter=adapter)
+    assert "http" in prompt
+    assert "curl" in prompt
+
+
+async def test_target_info_from_understander_renders_nc_ssl_hint():
+    """理解层 target_info(yml access 解析出)带 nc_ssl → 同样渲染 TLS 提示(不依赖兜底)。"""
+    task = {"challenge_id": "c-1",
+            "target_info": {"kind": "host_port", "host": "abc.tcp-ctf2.dasctf.com",
+                            "port": 9999, "source": "target", "nc_ssl": True,
+                            "access": {"access_type": "tcp",
+                                       "access_url": "abc.tcp-ctf2.dasctf.com:9999"}}}
+    prompt = await _capture_prompt(task=task)
+    assert "# 目标地址(靶机)" in prompt
+    assert "abc.tcp-ctf2.dasctf.com:9999" in prompt
+    assert "TLS" in prompt
+
+
+async def test_access_info_drops_lifecycle_noise():
+    """_access_info 只提取语义字段:地址/协议/nc_ssl/URL,丢掉环境生命周期噪音。"""
+    info = RealExecutor._access_info(
+        {"host": "h", "port": 8080, "access_type": "http", "nc_ssl": False,
+         "access_url": "http://h:8080", "environment_id": "e1", "status": "running",
+         "expires_at": "2030-01-01", "raw": {"huge": "blob"}},
+        host="h", port=8080)
+    assert info["host"] == "h" and info["port"] == 8080
+    assert info["access_type"] == "http" and info["nc_ssl"] is False
+    assert info["access_url"] == "http://h:8080"
+    assert "environment_id" not in info and "status" not in info
+    assert "expires_at" not in info and "raw" not in info
+    assert info["source"] == "start_target"
+
+
+async def test_render_target_hints_empty_for_none():
+    assert RealExecutor._render_target_hints(None) == ""
+    assert RealExecutor._render_target_hints({}) == ""
+    assert RealExecutor._render_target_hints({"host": "x"}) == ""
+
+
 class _FlakyTargetAdapter:
     """前 fail_count 次 start_target 抛瞬态错误(模拟平台 429),之后成功。"""
 

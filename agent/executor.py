@@ -333,6 +333,7 @@ class RealExecutor(Executor):
         self._llm = llm_fn or self._default_llm()
         self._target_resolved = False  # 目标地址惰性解析,成功即缓存(避免重复开靶)
         self._target_cache: str | None = None
+        self._target_info: dict | None = None  # 完整连接信息(host/port/access_type/nc_ssl/...),供提示词渲染
         self._target_failed_at: float | None = None  # 上次解析失败时间戳(退避重试依据)
         self._target_retry_delay: float = 60.0  # 失败后至少隔多久重试一次 start_target
         if self.adapter is not None:
@@ -507,11 +508,13 @@ class RealExecutor(Executor):
         task = (getattr(self.workspace, "meta", {}).get("task") or {}) if self.workspace else {}
         info = task.get("target_info")
         if isinstance(info, dict):
+            self._target_info = info
             self._target_cache = self._fmt_target(info) or None
             self._target_resolved = True
             return self._target_cache
         raw = task.get("target")
         if isinstance(raw, str) and raw.strip():
+            self._target_info = None
             self._target_cache = raw.strip()
             self._target_resolved = True
             return self._target_cache
@@ -526,7 +529,8 @@ class RealExecutor(Executor):
                 return None
             host, port = r.get("host") or "", r.get("port")
             if host and port:
-                self._target_cache = f"{host}:{port}"
+                self._target_info = self._access_info(r, host=host, port=port)
+                self._target_cache = self._fmt_target(self._target_info) or f"{host}:{port}"
                 self._target_resolved = True
                 self._target_failed_at = None
                 return self._target_cache
@@ -559,6 +563,45 @@ class RealExecutor(Executor):
             return f"{host}:{info['port']}"
         return str(host)
 
+    @staticmethod
+    def _access_info(r: dict, *, host: str = "", port=None) -> dict:
+        """从 start_target 响应提取 LLM 需要的连接信息(镜像理解层 target_info 语义)。
+
+        只挑语义字段:地址 + 协议(access_type)+ TLS 包裹(nc_ssl)+ 完整 URL;生命周期
+        噪音(environment_id/status/expires_at/raw)不进,避免提示词被无关信息污染。
+        """
+        info: dict = {"kind": "host_port", "source": "start_target"}
+        if host:
+            info["host"] = host
+        if port is not None:
+            try:
+                info["port"] = int(port)
+            except (TypeError, ValueError):
+                info["port"] = port
+        for k in ("access_url", "access_urls", "access_type", "nc_ssl"):
+            if r.get(k) is not None:
+                info[k] = r[k]
+        return info
+
+    @staticmethod
+    def _render_target_hints(info: dict | None) -> str:
+        """按连接信息渲染给 LLM 的访问提示(nc_ssl 必须 TLS、http 用 curl)。"""
+        if not isinstance(info, dict):
+            return ""
+        lines = []
+        if info.get("nc_ssl"):
+            lines.append(
+                "端口被平台 TLS 转发器包裹(nc_ssl=true):必须用 TLS/SSL 连接"
+                "(SNI + 关闭证书校验),裸 TCP 只会收到 0 字节。"
+            )
+        if info.get("access_type") == "http":
+            url = info.get("access_url") or ""
+            lines.append(
+                "协议为 http:用 curl/requests 发 HTTP 请求解题,不是 nc 裸连接。"
+                + (f"完整 URL: {url}" if url else "")
+            )
+        return "\n".join(lines)
+
     def _build_prompt(self, step, ctx: str) -> str:
         parts = []
         if step is not None:
@@ -575,6 +618,9 @@ class RealExecutor(Executor):
                 f"{target}\n"
                 "用 nc/pwntools 连接该地址解题(容器题目标为动态分配,只此一次有效)。"
             )
+            hints = self._render_target_hints(self._target_info)
+            if hints:
+                parts.append("# 连接注意\n" + hints)
         if ctx:
             parts.append("# 上下文\n" + ctx)
         return "\n\n".join(parts)
